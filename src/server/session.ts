@@ -905,6 +905,11 @@ function getMappedContextSpanForProject(documentSpan: DocumentSpan, project: Pro
     return getMappedContextSpan(documentSpan, project.getSourceMapper(), p => project.projectService.fileExists(p as NormalizedPath));
 }
 
+interface DefinitionInfosWithProject {
+    readonly definitionInfos: readonly DefinitionInfo[];
+    readonly project: Project;
+}
+
 const invalidPartialSemanticModeCommands: readonly protocol.CommandTypes[] = [
     protocol.CommandTypes.OpenExternalProject,
     protocol.CommandTypes.OpenExternalProjects,
@@ -1609,11 +1614,60 @@ export class Session<TMessage = string> implements EventSender {
             : diagnostics.map(d => formatDiag(file, project, d));
     }
 
-    private getDefinition(args: protocol.FileLocationRequestArgs, simplifiedResult: boolean): readonly protocol.FileSpanWithContext[] | readonly DefinitionInfo[] {
-        const { file, project } = this.getFileAndProject(args);
+    private deduplicateDefinitions(
+        definitionsPerProject: readonly DefinitionInfosWithProject[],
+        simplifiedResult: boolean
+    ): readonly protocol.FileSpanWithContext[] | readonly DefinitionInfo[] {
+        const seenDefinitions = new Set<string>();
+        const returnDefinitions: protocol.FileSpanWithContext[] & DefinitionInfo[] = [];
+
+        for (const projectDefinitions of definitionsPerProject) {
+            for (const definition of projectDefinitions.definitionInfos) {
+                const key = `${definition.fileName}|${definition.textSpan.start}|${definition.textSpan.length}`;
+                if (seenDefinitions.has(key)) {
+                    continue;
+                }
+                seenDefinitions.add(key);
+
+                if (simplifiedResult)
+                    returnDefinitions.push(...this.mapDefinitionInfo([definition], projectDefinitions.project));
+                else
+                    returnDefinitions.push(Session.mapToOriginalLocation(definition));
+            }
+        }
+
+        return returnDefinitions;
+    }
+
+
+    private getDefinition(
+        args: protocol.FileLocationRequestArgs,
+        simplifiedResult: boolean,
+    ): readonly protocol.FileSpanWithContext[] | readonly DefinitionInfo[] {
+        const file = toNormalizedPath(args.file);
+        const prefs = this.getPreferences(file);
+        if (!prefs.mergeDefinitionsAcrossProjects) {
+            const { file: singleFile, project } = this.getFileAndProject(args);
+            const position = this.getPositionInFile(args, singleFile);
+            const definitions = this.mapDefinitionInfoLocations(project.getLanguageService().getDefinitionAtPosition(singleFile, position) || emptyArray, project);
+            return simplifiedResult ? this.mapDefinitionInfo(definitions, project) : definitions.map(Session.mapToOriginalLocation);
+        }
+
+        const projects = this.getProjects(args, /*getScriptInfoEnsuringProjectsUptoDate*/ true);
         const position = this.getPositionInFile(args, file);
-        const definitions = this.mapDefinitionInfoLocations(project.getLanguageService().getDefinitionAtPosition(file, position) || emptyArray, project);
-        return simplifiedResult ? this.mapDefinitionInfo(definitions, project) : definitions.map(Session.mapToOriginalLocation);
+        const definitionInfosWithProject: DefinitionInfosWithProject[] = [];
+
+        forEachProjectInProjects(projects, /*path*/ undefined, (project: Project) => {
+            definitionInfosWithProject.push({
+                definitionInfos: this.mapDefinitionInfoLocations(
+                    project.getLanguageService().getDefinitionAtPosition(file, position) || emptyArray,
+                    project,
+                ),
+                project,
+            });
+        });
+
+        return this.deduplicateDefinitions(definitionInfosWithProject, simplifiedResult);
     }
 
     private mapDefinitionInfoLocations(definitions: readonly DefinitionInfo[], project: Project): readonly DefinitionInfo[] {
@@ -1631,33 +1685,77 @@ export class Session<TMessage = string> implements EventSender {
         });
     }
 
-    private getDefinitionAndBoundSpan(args: protocol.FileLocationRequestArgs, simplifiedResult: boolean): protocol.DefinitionInfoAndBoundSpan | DefinitionInfoAndBoundSpan {
-        const { file, project } = this.getFileAndProject(args);
+    private getDefinitionAndBoundSpan(
+        args: protocol.FileLocationRequestArgs,
+        simplifiedResult: boolean,
+    ): protocol.DefinitionInfoAndBoundSpan | DefinitionInfoAndBoundSpan {
+        const file = toNormalizedPath(args.file);
+        const prefs = this.getPreferences(file);
+        if (!prefs.mergeDefinitionsAcrossProjects) {
+            const { project } = this.getFileAndProject(args);
+            const position = this.getPositionInFile(args, file);
+            const scriptInfo = Debug.checkDefined(project.getScriptInfo(file));
+
+            const unmapped = project.getLanguageService().getDefinitionAndBoundSpan(file, position);
+            if (!unmapped || !unmapped.definitions) {
+                return { definitions: emptyArray, textSpan: undefined! };
+            }
+            const definitions = this.mapDefinitionInfoLocations(unmapped.definitions, project);
+            if (simplifiedResult) {
+                return {
+                    definitions: this.mapDefinitionInfo(definitions, project),
+                    textSpan: toProtocolTextSpan(unmapped.textSpan, scriptInfo),
+                };
+            }
+            return { definitions: definitions.map(Session.mapToOriginalLocation), textSpan: unmapped.textSpan };
+        }
+
+        let textSpan: TextSpan | protocol.TextSpan | undefined;
+
+        const projects = this.getProjects(args, /*getScriptInfoEnsuringProjectsUptoDate*/ true);
         const position = this.getPositionInFile(args, file);
-        const scriptInfo = Debug.checkDefined(project.getScriptInfo(file));
+        const definitionInfosWithProject: DefinitionInfosWithProject[] = [];
 
-        const unmappedDefinitionAndBoundSpan = project.getLanguageService().getDefinitionAndBoundSpan(file, position);
+        forEachProjectInProjects(projects, /*path*/ undefined, (project: Project) => {
+            let unmappedDefinitions: readonly DefinitionInfo[] = [];
+            if (!textSpan) {
+                const unmapped = project.getLanguageService().getDefinitionAndBoundSpan(file, position);
+                if (!unmapped || !unmapped.definitions) {
+                    return;
+                }
+                unmappedDefinitions = unmapped.definitions;
+                if (simplifiedResult) {
+                    const scriptInfo = Debug.checkDefined(project.getScriptInfo(file));
+                    textSpan = toProtocolTextSpan(unmapped.textSpan, scriptInfo);
+                } else {
+                    textSpan = unmapped.textSpan;
+                }
+            } else {
+                const definitions = project.getLanguageService().getDefinitionAtPosition(file, position);
+                if (!definitions) {
+                    return;
+                }
+                unmappedDefinitions = definitions;
+            }
 
-        if (!unmappedDefinitionAndBoundSpan || !unmappedDefinitionAndBoundSpan.definitions) {
-            return {
-                definitions: emptyArray,
-                textSpan: undefined!, // TODO: GH#18217
-            };
+            definitionInfosWithProject.push({
+                definitionInfos: this.mapDefinitionInfoLocations(unmappedDefinitions, project),
+                project,
+            });
+        });
+
+        const deduplicatedDefinitions = this.deduplicateDefinitions(definitionInfosWithProject, simplifiedResult);
+
+        if (deduplicatedDefinitions.length === 0) {
+            return { definitions: emptyArray, textSpan: undefined! };
         }
 
-        const definitions = this.mapDefinitionInfoLocations(unmappedDefinitionAndBoundSpan.definitions, project);
-        const { textSpan } = unmappedDefinitionAndBoundSpan;
-
-        if (simplifiedResult) {
-            return {
-                definitions: this.mapDefinitionInfo(definitions, project),
-                textSpan: toProtocolTextSpan(textSpan, scriptInfo),
-            };
-        }
-
-        return {
-            definitions: definitions.map(Session.mapToOriginalLocation),
-            textSpan,
+        return simplifiedResult ? {
+            definitions: deduplicatedDefinitions as readonly protocol.DefinitionInfo[],
+            textSpan: textSpan! as protocol.TextSpan,
+        } : {
+            definitions: deduplicatedDefinitions as readonly DefinitionInfo[],
+            textSpan: textSpan! as TextSpan,
         };
     }
 

@@ -181,6 +181,7 @@ export * from "./unittests/tsserver/getExportReferences.js";
 export * from "./unittests/tsserver/getFileReferences.js";
 export * from "./unittests/tsserver/getMoveToRefactoringFileSuggestions.js";
 export * from "./unittests/tsserver/goToDefinition.js";
+export * from "./unittests/tsserver/goToDefinitionAcrossProjects.js";
 export * from "./unittests/tsserver/importHelpers.js";
 export * from "./unittests/tsserver/inconsistentErrorInEditor.js";
 export * from "./unittests/tsserver/inferredProjects.js";

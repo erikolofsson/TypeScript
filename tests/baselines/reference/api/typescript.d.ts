@@ -3505,6 +3505,7 @@ declare namespace ts {
             private getCompilerOptionsDiagnostics;
             private convertToDiagnosticsWithLinePosition;
             private getDiagnosticsWorker;
+            private deduplicateDefinitions;
             private getDefinition;
             private mapDefinitionInfoLocations;
             private getDefinitionAndBoundSpan;
@@ -8428,6 +8429,12 @@ declare namespace ts {
          * Default: `500`
          */
         readonly maximumHoverLength?: number;
+        /**
+         * When getting definitions look across all projects that contain the file. This can be useful when definitions are
+         * not the same in different projects, in which case you will get returned multiple definitions, when without this flag
+         * you will only get one random definition.
+         */
+        readonly mergeDefinitionsAcrossProjects?: boolean;
     }
     type OrganizeImportsTypeOrder = "last" | "inline" | "first";
     /** Represents a bigint literal value without requiring bigint support */
